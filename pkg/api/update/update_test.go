@@ -617,7 +617,7 @@ func TestHandleConcurrentRequests(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calledCount atomic.Int32
 
-		mockUpdateFn := func(_ []string) *metrics.Metric { // Use _ for unused images parameter.
+		mockUpdateFn := func(_ []string) *metrics.Metric {
 			calledCount.Add(1)
 
 			return &metrics.Metric{Scanned: 8, Updated: 0, Failed: 0}
@@ -796,6 +796,148 @@ func TestConcurrentRequests(t *testing.T) {
 	})
 }
 
+// TestAsyncFullUpdateReturns202WhenLockAcquired verifies that an async POST request for a full update
+// returns 202 Accepted with an empty body and triggers the update asynchronously.
+func TestAsyncFullUpdateReturns202WhenLockAcquired(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var called atomic.Int32
+
+		mockUpdateFn := func(images []string) *metrics.Metric {
+			called.Add(1)
+
+			return &metrics.Metric{Scanned: 8, Updated: 0, Failed: 0}
+		}
+		handler := update.New(mockUpdateFn, nil)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update?async=true",
+			nil,
+		)
+		handler.Handle(rec, req)
+
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("expected status %d, got %d", http.StatusAccepted, rec.Code)
+		}
+
+		if rec.Body.Len() != 0 {
+			t.Errorf("expected empty body, got %q", rec.Body.String())
+		}
+
+		synctest.Wait()
+
+		if called.Load() != 1 {
+			t.Errorf("expected update function to be called once, got %d", called.Load())
+		}
+	})
+}
+
+// TestAsyncFullUpdateReturns429WhenLocked verifies that an async POST request for a full update
+// returns 429 Too Many Requests when the lock is already held.
+func TestAsyncFullUpdateReturns429WhenLocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		customLock := make(chan bool, 1) // lock held (empty)
+
+		handler := update.New(func(_ []string) *metrics.Metric {
+			t.Error("update function should not be called when lock is unavailable")
+
+			return &metrics.Metric{}
+		}, customLock)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update?async=true",
+			nil,
+		)
+		handler.Handle(rec, req)
+
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("expected status %d, got %d", http.StatusTooManyRequests, rec.Code)
+		}
+
+		if rec.Header().Get("Content-Type") != "application/json" {
+			t.Errorf("expected Content-Type application/json, got %s", rec.Header().Get("Content-Type"))
+		}
+
+		if rec.Header().Get("Retry-After") != "30" {
+			t.Errorf("expected Retry-After 30, got %s", rec.Header().Get("Retry-After"))
+		}
+
+		var response map[string]any
+
+		err := json.Unmarshal(rec.Body.Bytes(), &response)
+		if err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		errMsg, ok := response["error"].(string)
+		if !ok || errMsg != "another update is already running" {
+			t.Errorf("unexpected error message: %v", response["error"])
+		}
+
+		synctest.Wait()
+	})
+}
+
+// TestAsyncTargetedUpdateBlocksWhenLocked verifies that an async POST request for a targeted update
+// blocks until the lock becomes available, then returns 202 and triggers the update.
+func TestAsyncTargetedUpdateBlocksWhenLocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		customLock := make(chan bool, 1) // lock held (empty)
+
+		var called atomic.Int32
+
+		handler := update.New(func(images []string) *metrics.Metric {
+			called.Add(1)
+
+			if len(images) != 1 || images[0] != "myimage:latest" {
+				t.Errorf("unexpected images: %v", images)
+			}
+
+			return &metrics.Metric{Scanned: 1, Updated: 1, Failed: 0}
+		}, customLock)
+
+		done := make(chan int, 1)
+
+		go func() {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodPost,
+				"/v1/update?image=myimage:latest&async=true",
+				nil,
+			)
+			handler.Handle(rec, req)
+
+			done <- rec.Code
+		}()
+
+		time.Sleep(10 * time.Millisecond)
+
+		if called.Load() != 0 {
+			t.Error("update function should not be called while lock is held")
+		}
+
+		// Release the lock
+		customLock <- true
+
+		synctest.Wait()
+
+		code := <-done
+		if code != http.StatusAccepted {
+			t.Errorf("expected status %d for async targeted update, got %d", http.StatusAccepted, code)
+		}
+
+		if called.Load() != 1 {
+			t.Errorf("expected 1 call, got %d", called.Load())
+		}
+	})
+}
+
 // faultyReadCloser simulates a body reader that fails.
 type faultyReadCloser struct {
 	err error
@@ -839,4 +981,187 @@ func (f *faultyResponseWriter) WriteHeader(statusCode int) {
 		f.ResponseWriter.WriteHeader(statusCode)
 	}
 	// Ignore subsequent calls to WriteHeader after writing has started
+}
+
+// TestReadRequestBodyRejectsOversizedBody verifies that requests exceeding the
+// maximum body size (1 MiB) receive a 413 Payload Too Large response.
+func TestReadRequestBodyRejectsOversizedBody(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		largeBody := bytes.Repeat([]byte("x"), (1<<20)+1)
+		mockUpdateFn := func(_ []string) *metrics.Metric {
+			t.Error("update function should not be called when body too large")
+
+			return &metrics.Metric{}
+		}
+		handler := update.New(mockUpdateFn, nil)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update",
+			bytes.NewReader(largeBody),
+		)
+		handler.Handle(rec, req)
+
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("expected status %d, got %d", http.StatusRequestEntityTooLarge, rec.Code)
+		}
+
+		synctest.Wait()
+	})
+}
+
+// TestAcquireLockCancelsForTargetedUpdate verifies that a targeted update request
+// returns 503 Service Unavailable if the request context is cancelled while waiting.
+func TestAcquireLockCancelsForTargetedUpdate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		customLock := make(chan bool, 1) // lock held (empty)
+
+		var called atomic.Int32
+
+		handler := update.New(func(_ []string) *metrics.Metric {
+			called.Add(1)
+
+			return &metrics.Metric{}
+		}, customLock)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/update?image=test:latest", nil)
+		handler.Handle(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
+		}
+
+		if called.Load() != 0 {
+			t.Errorf("update function should not be called after cancellation")
+		}
+
+		synctest.Wait()
+	})
+}
+
+// TestExecuteUpdateAsyncRecoversFromPanic verifies that if the update function panics,
+// the async goroutine recovers and still releases the lock.
+func TestExecuteUpdateAsyncRecoversFromPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var panicked atomic.Int32
+
+		customLock := make(chan bool, 1)
+		customLock <- true
+
+		handler := update.New(func(images []string) *metrics.Metric {
+			panicked.Add(1)
+			panic("simulated panic")
+		}, customLock)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update?async=true",
+			nil,
+		)
+		handler.Handle(rec, req)
+
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("expected status %d, got %d", http.StatusAccepted, rec.Code)
+		}
+
+		synctest.Wait()
+
+		if panicked.Load() != 1 {
+			t.Error("update function should have panicked")
+		}
+		// Verify lock was released.
+		select {
+		case <-customLock:
+		default:
+			t.Error("lock was not released after panic")
+		}
+	})
+}
+
+// TestSend429ResponseHandlesWriteError verifies that 429 response write errors
+// are logged without panicking.
+func TestSend429ResponseHandlesWriteError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockUpdateFn := func(_ []string) *metrics.Metric { return &metrics.Metric{} }
+		customLock := make(chan bool, 1) // locked
+		handler := update.New(mockUpdateFn, customLock)
+		faulty := &faultyResponseWriter{ResponseWriter: httptest.NewRecorder()}
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update",
+			nil,
+		)
+		handler.Handle(faulty, req)
+
+		if faulty.lastStatusCode != http.StatusTooManyRequests {
+			t.Errorf("expected status %d, got %d", http.StatusTooManyRequests, faulty.lastStatusCode)
+		}
+	})
+}
+
+// TestWriteSuccessResponseHandlesWriteError verifies that 200 response write errors
+// are logged without panicking.
+func TestWriteSuccessResponseHandlesWriteError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockUpdateFn := func(_ []string) *metrics.Metric {
+			return &metrics.Metric{Scanned: 1, Updated: 1, Failed: 0}
+		}
+
+		customLock := make(chan bool, 1)
+		customLock <- true
+
+		handler := update.New(mockUpdateFn, customLock)
+		faulty := &faultyResponseWriter{ResponseWriter: httptest.NewRecorder()}
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update",
+			nil,
+		)
+		handler.Handle(faulty, req)
+
+		if faulty.lastStatusCode != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, faulty.lastStatusCode)
+		}
+	})
+}
+
+// TestHandleReturnsEarlyWhenRequestBodyInvalid verifies that Handle returns early
+// when the request body is unreadable, without calling the update function.
+func TestHandleReturnsEarlyWhenRequestBodyInvalid(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var called atomic.Int32
+
+		mockUpdateFn := func(_ []string) *metrics.Metric {
+			called.Add(1)
+
+			return &metrics.Metric{}
+		}
+		handler := update.New(mockUpdateFn, nil)
+		faultyReader := &faultyReadCloser{err: errors.New("read error")}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/update",
+			faultyReader,
+		)
+		handler.Handle(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("expected status %d, got %d", http.StatusInternalServerError, rec.Code)
+		}
+
+		if called.Load() != 0 {
+			t.Error("update function should not be called when body read fails")
+		}
+
+		synctest.Wait()
+	})
 }
