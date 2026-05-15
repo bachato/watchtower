@@ -519,6 +519,48 @@ var _ = ginkgo.Describe("shouldUpdateContainer", func() {
 		result := shouldUpdateContainer(container, true, params)
 		gomega.Expect(result).To(gomega.BeFalse())
 	})
+
+	ginkgo.It("should allow update of non-Watchtower containers when NoRestart is true", func() {
+		container := mockActions.CreateMockContainerWithConfig(
+			"non-watchtower-id",
+			"nginx",
+			"nginx:latest",
+			true,
+			false,
+			time.Now(),
+			&dockerContainer.Config{
+				Labels: map[string]string{},
+			},
+		)
+		params := types.UpdateParams{
+			NoRestart: true,
+		}
+		result := shouldUpdateContainer(container, true, params)
+		gomega.Expect(result).To(gomega.BeTrue())
+	})
+
+	ginkgo.It("should allow update of Watchtower containers when NoRestart is true", func() {
+		currentID := currentWatchtowerID
+		container := mockActions.CreateMockContainerWithConfig(
+			currentID,
+			"watchtower-current",
+			"watchtower:latest",
+			true,
+			false,
+			time.Now(),
+			&dockerContainer.Config{
+				Labels: map[string]string{
+					"com.centurylinklabs.watchtower": "true",
+				},
+			},
+		)
+		params := types.UpdateParams{
+			NoRestart:          true,
+			CurrentContainerID: types.ContainerID(currentID),
+		}
+		result := shouldUpdateContainer(container, true, params)
+		gomega.Expect(result).To(gomega.BeTrue())
+	})
 })
 
 var _ = ginkgo.Describe("linkedIdentifierMarkedForRestart", func() {
@@ -2394,8 +2436,9 @@ var _ = ginkgo.Describe("performRollingRestart", func() {
 						"container-1": true,
 						"container-2": true,
 					},
-					StopOrder:  []string{},
-					StartOrder: []string{},
+					StopOrder:   []string{},
+					CreateOrder: []string{},
+					StartOrder:  []string{},
 				},
 				false,
 				false,
@@ -2413,11 +2456,11 @@ var _ = ginkgo.Describe("performRollingRestart", func() {
 				nil,
 			)
 
-			// Verify start order is forward (container-0, container-1, container-2).
-			gomega.Expect(client.TestData.StartOrder).To(gomega.HaveLen(3))
-			gomega.Expect(client.TestData.StartOrder[0]).To(gomega.Equal("container-0"))
-			gomega.Expect(client.TestData.StartOrder[1]).To(gomega.Equal("container-1"))
-			gomega.Expect(client.TestData.StartOrder[2]).To(gomega.Equal("container-2"))
+			// Verify create order is forward (container-0, container-1, container-2).
+			gomega.Expect(client.TestData.CreateOrder).To(gomega.HaveLen(3))
+			gomega.Expect(client.TestData.CreateOrder[0]).To(gomega.Equal("container-0"))
+			gomega.Expect(client.TestData.CreateOrder[1]).To(gomega.Equal("container-1"))
+			gomega.Expect(client.TestData.CreateOrder[2]).To(gomega.Equal("container-2"))
 		})
 	})
 

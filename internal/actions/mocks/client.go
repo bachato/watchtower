@@ -32,6 +32,7 @@ type TestData struct {
 	RenameContainerCount         atomic.Int32                          // Number of times RenameContainer was called.
 	StopContainerCount           atomic.Int32                          // Number of times StopContainer was called.
 	StartContainerCount          atomic.Int32                          // Number of times StartContainer was called.
+	CreateContainerCount         atomic.Int32                          // Number of times CreateContainer was called.
 	UpdateContainerCount         atomic.Int32                          // Number of times UpdateContainer was called.
 	IsContainerStaleCount        atomic.Int32                          // Number of times IsContainerStale was called.
 	WaitForContainerHealthyCount atomic.Int32                          // Number of times WaitForContainerHealthy was called.
@@ -45,11 +46,13 @@ type TestData struct {
 	ListContainersFailCount      int                                   // Number of times ListContainers should fail before succeeding.
 	StopContainerError           error                                 // Error to return from StopContainer (for testing).
 	StartContainerError          error                                 // Error to return from StartContainer (for testing).
+	CreateContainerError         error                                 // Error to return from CreateContainer (for testing).
 	UpdateContainerError         error                                 // Error to return from UpdateContainer (for testing).
 	StopContainerFailCount       int                                   // Number of times StopContainer should fail before succeeding.
 	RemoveImageError             error                                 // Error to return from RemoveImageByID (for testing).
 	FailedImageIDs               []types.ImageID                       // List of image IDs that should fail removal.
 	StopOrder                    []string                              // Order in which containers were stopped.
+	CreateOrder                  []string                              // Order in which containers were created.
 	StartOrder                   []string                              // Order in which containers were started.
 	SimulatedLatency             time.Duration                         // Simulated latency for operations (default 0 for fast tests, set for context cancellation tests).
 	LastContainerChain           string                                // Last container chain passed to CreateEphemeralOrchestrator.
@@ -196,6 +199,26 @@ func (client MockClient) IsContainerRunning(c types.Container) bool {
 	return !client.Stopped[string(c.ID())]
 }
 
+// CreateContainer simulates creating a new container from a source container's
+// configuration without starting it.
+// It provides a minimal implementation for testing purposes.
+// Returns the configured CreateContainerError if set.
+func (client MockClient) CreateContainer(ctx context.Context, c types.Container) (types.ContainerID, error) {
+	client.TestData.CreateContainerCount.Add(1)
+
+	if err := client.checkContextCancellation(ctx); err != nil {
+		return "", err
+	}
+
+	if client.TestData.CreateContainerError != nil {
+		return "", client.TestData.CreateContainerError
+	}
+
+	client.TestData.CreateOrder = append(client.TestData.CreateOrder, c.Name())
+
+	return c.ID(), nil
+}
+
 // StartContainer simulates starting a container, returning the container's ID.
 // It provides a minimal implementation for testing purposes.
 // Returns the configured StartContainerError if set.
@@ -228,9 +251,6 @@ func (client MockClient) StartContainerByID(ctx context.Context, containerID typ
 	if client.TestData.StartContainerError != nil {
 		return client.TestData.StartContainerError
 	}
-
-	client.TestData.StartOrder = append(client.TestData.StartOrder, string(containerID))
-	client.Stopped[string(containerID)] = false
 
 	return nil
 }

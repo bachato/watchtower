@@ -747,7 +747,6 @@ func UpdateImplicitRestart(
 // It checks multiple conditions:
 // - The container must be stale (outdated image)
 // - The container must not be monitor-only
-// - Updates are allowed unless NoRestart is true and it's not a Watchtower container
 // - Watchtower containers are skipped in run-once mode
 // - Watchtower self-updates are skipped if SkipSelfUpdate is true
 //
@@ -770,12 +769,6 @@ func shouldUpdateContainer(
 
 	// Skip monitor-only containers
 	if container.IsMonitorOnly(config) {
-		return false
-	}
-
-	// Allow update if NoRestart is false, or if it's a Watchtower container
-	// (which can update even with NoRestart)
-	if config.NoRestart && !container.IsWatchtower() {
 		return false
 	}
 
@@ -1689,8 +1682,7 @@ func restartStaleContainer(
 		"image":     sourceContainer.ImageName(),
 	}
 
-	renamed := false
-	newContainerID := sourceContainer.ID() // Default to original ID
+	var renamed bool
 
 	// Rename Watchtower containers regardless of NoRestart flag,
 	// but skip in run-once mode as there's no need to avoid conflicts
@@ -1782,16 +1774,31 @@ func restartStaleContainer(
 		}
 	}
 
+	// Create the new container with updated configuration.
+	//nolint:contextcheck // Using detached context intentionally to survive parent cancellation
+	newContainerID, err := client.CreateContainer(detachedCtx, sourceContainer)
+	if err != nil {
+		logrus.WithFields(fields).
+			WithError(err).
+			Debug("Failed to create container")
+
+		return "",
+			renamed,
+			fmt.Errorf(
+				"%w: %w",
+				errCreateContainerFailed,
+				err,
+			)
+	}
+
 	// Start the new container unless restarts are disabled.
 	// Watchtower containers are always started.
 	if !config.NoRestart || sourceContainer.IsWatchtower() {
 		logrus.WithFields(fields).
 			Debug("Starting container with updated configuration")
 
-		var err error
-
-		// Start the new container.
-		newContainerID, err = client.StartContainer(ctx, sourceContainer)
+		//nolint:contextcheck // Using detached context intentionally to survive parent cancellation
+		err = client.StartContainerByID(detachedCtx, newContainerID)
 		if err != nil {
 			logrus.WithFields(fields).
 				WithError(err).
@@ -1824,6 +1831,10 @@ func restartStaleContainer(
 					err,
 				)
 		}
+
+		logrus.WithFields(fields).
+			WithField("new_id", newContainerID.ShortID()).
+			Info("Started new container")
 
 		// Run post-update lifecycle hooks for restarting containers if enabled.
 		if sourceContainer.ToRestart() && config.LifecycleHooks {
